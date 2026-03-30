@@ -1,0 +1,18 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(grep -r \"mcp\\\\|tool\\\\|MCP\" /Users/mtl/code/cf-playground --include=*.ts --include=*.tsx --include=*.json ! -path */node_modules/* ! -path */.git/*)",
+      "Bash(find /Users/mtl/code/cf-playground -maxdepth 3 -type d ! -path */node_modules/* ! -path */.wrangler/* ! -path */.git/*)",
+      "WebSearch",
+      "WebFetch(domain:blog.cloudflare.com)",
+      "WebFetch(domain:developers.cloudflare.com)",
+      "Bash(npm show:*)",
+      "Bash(find /Users/mtl/code/mcp-demo-night/demo-agent/node_modules/agents -name *.d.ts)",
+      "Bash(npm init:*)",
+      "Bash(npm install:*)",
+      "Bash(node:*)",
+      "Bash(npx wrangler:*)",
+      "Bash(npx tsc:*)"
+    ]
+  }
+}

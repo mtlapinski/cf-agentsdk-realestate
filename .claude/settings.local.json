@@ -12,7 +12,18 @@
       "Bash(npm install:*)",
       "Bash(node:*)",
       "Bash(npx wrangler:*)",
-      "Bash(npx tsc:*)"
+      "Bash(npx tsc:*)",
+      "Bash(git config:*)",
+      "Bash(gh repo:*)",
+      "Bash(brew install:*)",
+      "Bash(wait)",
+      "Bash(/opt/homebrew/bin/gh --version)",
+      "Read(//usr/local/bin/**)",
+      "Bash(git remote:*)",
+      "Bash(git commit:*)",
+      "Bash(git push:*)",
+      "Bash(curl:*)",
+      "Bash(git add:*)"
     ]
   }
 }

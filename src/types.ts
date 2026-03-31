@@ -1,4 +1,7 @@
 export type Env = {
+  // Static assets binding
+  ASSETS: Fetcher;
+
   // Durable Object namespace
   REAL_ESTATE_AGENT: DurableObjectNamespace;
 

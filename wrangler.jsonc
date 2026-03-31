@@ -6,7 +6,8 @@
   "compatibility_flags": ["nodejs_compat"],
 
   "assets": {
-    "directory": "./public"
+    "directory": "./public",
+    "binding": "ASSETS"
   },
 
   "migrations": [
@@ -32,7 +33,7 @@
   ],
 
   "vars": {
-    "LISTINGS_API_URL": "http://localhost:8787"
+    "LISTINGS_API_URL": "https://homefront-api.steep-recipe-f463.workers.dev"
   },
 
   "dev": {

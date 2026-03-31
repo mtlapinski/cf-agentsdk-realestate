@@ -5,12 +5,24 @@ import type { Env } from './types';
 
 const app = new Hono<{ Bindings: Env }>();
 
+const SESSION_ID = 'default';
+
+function getAgentStub(env: Env): RealEstateAgent {
+  const id = env.REAL_ESTATE_AGENT.idFromName(SESSION_ID);
+  return env.REAL_ESTATE_AGENT.get(id) as unknown as RealEstateAgent;
+}
+
 app.get('/health', (c) => c.json({ status: 'ok', ts: Date.now() }));
 
+app.get('/api/usage', async (c) => {
+  const stub = getAgentStub(c.env);
+  const usage = await stub.getUsage();
+  return c.json(usage);
+});
+
 app.post('/api/clear', async (c) => {
-  const id = c.env.REAL_ESTATE_AGENT.idFromName('default');
-  const stub = c.env.REAL_ESTATE_AGENT.get(id) as unknown as RealEstateAgent;
-  await (stub as any).clearState?.();
+  const stub = getAgentStub(c.env);
+  await stub.resetUsage();
   return c.json({ success: true });
 });
 

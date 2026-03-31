@@ -11,18 +11,33 @@ import { createAnthropic } from '@ai-sdk/anthropic';
 import { z } from 'zod';
 import type { Env } from './types';
 
+export type UsageStats = {
+  inputTokens: number;
+  outputTokens: number;
+  requests: number;
+};
+
 export class RealEstateAgent extends AIChatAgent<Env> {
   private cachedToken: string | null = null;
 
+  private log(event: string, data?: Record<string, unknown>) {
+    console.log(JSON.stringify({ ts: new Date().toISOString(), event, ...data }));
+  }
+
   private async getToken(): Promise<string> {
-    if (this.cachedToken) return this.cachedToken;
+    if (this.cachedToken) {
+      this.log('auth.token_cache_hit');
+      return this.cachedToken;
+    }
 
     const stored = await this.ctx.storage.get<string>('jwt-token');
     if (stored) {
+      this.log('auth.token_storage_hit');
       this.cachedToken = stored;
       return stored;
     }
 
+    this.log('auth.login_start', { email: this.env.SELLER_EMAIL });
     const resp = await fetch(`${this.env.LISTINGS_API_URL}/auth/login`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -34,12 +49,14 @@ export class RealEstateAgent extends AIChatAgent<Env> {
 
     if (!resp.ok) {
       const text = await resp.text();
+      this.log('auth.login_failed', { status: resp.status, body: text });
       throw new Error(`Auth failed ${resp.status}: ${text}`);
     }
 
     const { token } = (await resp.json()) as { token: string };
     this.cachedToken = token;
     await this.ctx.storage.put('jwt-token', token);
+    this.log('auth.login_success');
     return token;
   }
 
@@ -48,8 +65,11 @@ export class RealEstateAgent extends AIChatAgent<Env> {
     path: string,
     options: { method?: string; body?: unknown } = {}
   ): Promise<unknown> {
+    const method = options.method ?? 'GET';
+    this.log('api.request', { method, path });
+
     const resp = await fetch(`${this.env.LISTINGS_API_URL}${path}`, {
-      method: options.method ?? 'GET',
+      method,
       headers: {
         'Content-Type': 'application/json',
         Authorization: `Bearer ${token}`,
@@ -59,10 +79,29 @@ export class RealEstateAgent extends AIChatAgent<Env> {
 
     if (!resp.ok) {
       const text = await resp.text();
-      throw new Error(`API ${options.method ?? 'GET'} ${path} failed ${resp.status}: ${text}`);
+      this.log('api.error', { method, path, status: resp.status, body: text });
+      throw new Error(`API ${method} ${path} failed ${resp.status}: ${text}`);
     }
 
+    this.log('api.response', { method, path, status: resp.status });
     return resp.json();
+  }
+
+  async getUsage(): Promise<UsageStats> {
+    return (
+      (await this.ctx.storage.get<UsageStats>('usage')) ?? {
+        inputTokens: 0,
+        outputTokens: 0,
+        requests: 0,
+      }
+    );
+  }
+
+  async resetUsage(): Promise<void> {
+    await this.ctx.storage.delete('usage');
+    await this.ctx.storage.delete('jwt-token');
+    this.cachedToken = null;
+    this.log('state.reset');
   }
 
   async onChatMessage(onFinish: StreamTextOnFinishCallback<ToolSet>) {
@@ -70,12 +109,15 @@ export class RealEstateAgent extends AIChatAgent<Env> {
     const model = anthropic('claude-sonnet-4-5');
 
     const token = await this.getToken();
+    const msgCount = this.messages.length;
+    this.log('chat.message_received', { messageCount: msgCount });
 
     const tools = {
       listMyListings: tool({
         description: 'Get all listings belonging to the authenticated seller.',
         inputSchema: z.object({}),
         execute: async (_args) => {
+          this.log('tool.listMyListings');
           const data = await this.apiFetch(token, '/listings/mine/all');
           return JSON.stringify(data);
         },
@@ -106,10 +148,12 @@ export class RealEstateAgent extends AIChatAgent<Env> {
           status: z.enum(['draft', 'active']).default('draft'),
         }),
         execute: async (input: Record<string, unknown>) => {
+          this.log('tool.createListing', { title: input.title, price: input.price });
           const data = await this.apiFetch(token, '/listings', {
             method: 'POST',
             body: input,
           });
+          this.log('tool.createListing.success', { result: data });
           return JSON.stringify(data);
         },
       }),
@@ -121,7 +165,26 @@ export class RealEstateAgent extends AIChatAgent<Env> {
       messages: convertToModelMessages(this.messages),
       tools,
       stopWhen: stepCountIs(4),
-      onFinish: onFinish as unknown as StreamTextOnFinishCallback<typeof tools>,
+      onFinish: async (event) => {
+        const usage = event.usage;
+        if (usage) {
+          const current = await this.getUsage();
+          const updated: UsageStats = {
+            inputTokens: current.inputTokens + (usage.inputTokens ?? 0),
+            outputTokens: current.outputTokens + (usage.outputTokens ?? 0),
+            requests: current.requests + 1,
+          };
+          await this.ctx.storage.put('usage', updated);
+          this.log('chat.finished', {
+            inputTokens: usage.inputTokens,
+            outputTokens: usage.outputTokens,
+            totalInputTokens: updated.inputTokens,
+            totalOutputTokens: updated.outputTokens,
+            totalRequests: updated.requests,
+          });
+        }
+        (onFinish as unknown as StreamTextOnFinishCallback<typeof tools>)(event as any);
+      },
     });
 
     return result.toUIMessageStreamResponse();

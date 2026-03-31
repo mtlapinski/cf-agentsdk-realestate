@@ -14,12 +14,21 @@
   <body class="min-h-screen flex flex-col">
 
     <!-- Header -->
-    <header class="border-b border-zinc-800 px-6 py-4 flex items-center justify-between">
+    <header class="border-b border-zinc-800 px-6 py-3 flex items-center justify-between">
       <h1 class="font-semibold text-zinc-100">Real Estate Agent</h1>
-      <button
-        id="clearBtn"
-        class="text-xs text-zinc-500 hover:text-zinc-300 border border-zinc-700 rounded px-3 py-1 transition-colors"
-      >Clear</button>
+
+      <!-- Token counter -->
+      <div class="flex items-center gap-4">
+        <div id="tokenStats" class="text-xs text-zinc-500 flex gap-3 font-mono">
+          <span>↑ <span id="inputTokens">0</span> in</span>
+          <span>↓ <span id="outputTokens">0</span> out</span>
+          <span>⟳ <span id="requests">0</span> req</span>
+        </div>
+        <button
+          id="clearBtn"
+          class="text-xs text-zinc-500 hover:text-zinc-300 border border-zinc-700 rounded px-3 py-1 transition-colors"
+        >Clear</button>
+      </div>
     </header>
 
     <!-- Messages -->
@@ -44,7 +53,7 @@
     <script>
       marked.setOptions({ breaks: true, gfm: true });
 
-      const SESSION_ID = 'session-1';
+      const SESSION_ID = 'default';
       const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
       const wsUrl = `${protocol}//${location.host}/agents/real-estate-agent/${SESSION_ID}`;
 
@@ -52,11 +61,25 @@
       const inputEl = document.getElementById('input');
       const sendBtn = document.getElementById('sendBtn');
       const clearBtn = document.getElementById('clearBtn');
+      const inputTokensEl = document.getElementById('inputTokens');
+      const outputTokensEl = document.getElementById('outputTokens');
+      const requestsEl = document.getElementById('requests');
 
       let ws = null;
       let chatMessages = [];
       let streaming = { element: null, content: '' };
       let toolElement = null;
+      let awaitingResponse = false;
+
+      async function refreshUsage() {
+        try {
+          const resp = await fetch('/api/usage');
+          const { inputTokens, outputTokens, requests } = await resp.json();
+          inputTokensEl.textContent = inputTokens.toLocaleString();
+          outputTokensEl.textContent = outputTokens.toLocaleString();
+          requestsEl.textContent = requests.toLocaleString();
+        } catch {}
+      }
 
       function connect() {
         ws = new WebSocket(wsUrl);
@@ -64,6 +87,7 @@
         ws.onopen = () => {
           sendBtn.disabled = false;
           appendStatus('Connected');
+          refreshUsage();
         };
 
         ws.onclose = () => {
@@ -98,6 +122,12 @@
             break;
 
           case 'text-end':
+            if (awaitingResponse) {
+              awaitingResponse = false;
+              sendBtn.disabled = false;
+              inputEl.disabled = false;
+              refreshUsage();
+            }
             streaming.element = null;
             break;
 
@@ -106,9 +136,7 @@
             break;
 
           case 'tool-output-available':
-            if (toolElement) {
-              appendToolOutput(toolElement, ev.output);
-            }
+            if (toolElement) appendToolOutput(toolElement, ev.output);
             break;
         }
       }
@@ -124,7 +152,7 @@
 
       function appendUser(text) {
         const div = document.createElement('div');
-        div.className = 'ml-8 bg-zinc-800 rounded-lg px-4 py-2.5 text-sm text-zinc-100 self-end';
+        div.className = 'ml-8 bg-zinc-800 rounded-lg px-4 py-2.5 text-sm text-zinc-100';
         div.textContent = text;
         messagesEl.appendChild(div);
         scrollBottom();
@@ -161,12 +189,16 @@
 
       function send() {
         const text = inputEl.value.trim();
-        if (!text || !ws || ws.readyState !== WebSocket.OPEN) return;
+        if (!text || !ws || ws.readyState !== WebSocket.OPEN || awaitingResponse) return;
 
         inputEl.value = '';
         appendUser(text);
 
         chatMessages.push({ id: crypto.randomUUID(), role: 'user', content: text });
+
+        awaitingResponse = true;
+        sendBtn.disabled = true;
+        inputEl.disabled = true;
 
         ws.send(JSON.stringify({
           type: 'cf_agent_use_chat_request',
@@ -185,6 +217,9 @@
         await fetch('/api/clear', { method: 'POST' });
         chatMessages = [];
         messagesEl.innerHTML = '';
+        inputTokensEl.textContent = '0';
+        outputTokensEl.textContent = '0';
+        requestsEl.textContent = '0';
         appendStatus('Cleared');
       });
 

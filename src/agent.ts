@@ -17,6 +17,8 @@ export type UsageStats = {
   requests: number;
 };
 
+export type ExecutionMode = 'direct' | 'codemode';
+
 export class RealEstateAgent extends AIChatAgent<Env> {
   private cachedToken: string | null = null;
   private cachedFullName: string | null = null;
@@ -24,6 +26,8 @@ export class RealEstateAgent extends AIChatAgent<Env> {
   private log(event: string, data?: Record<string, unknown>) {
     console.log(JSON.stringify({ ts: new Date().toISOString(), event, ...data }));
   }
+
+  // ─── Auth ────────────────────────────────────────────────────────────────
 
   private async getTokenAndName(): Promise<{ token: string; fullName: string }> {
     if (this.cachedToken && this.cachedFullName) {
@@ -101,9 +105,94 @@ export class RealEstateAgent extends AIChatAgent<Env> {
     return resp.json();
   }
 
+  // ─── Mode ─────────────────────────────────────────────────────────────────
+
   isCodeModeAvailable(): boolean {
     return typeof this.env.CODE_EXECUTOR !== 'undefined' && this.env.CODE_EXECUTOR !== null;
   }
+
+  async getMode(): Promise<ExecutionMode | null> {
+    const val = await this.ctx.storage.get<ExecutionMode>('execution-mode');
+    return val ?? null;
+  }
+
+  async setMode(mode: ExecutionMode): Promise<void> {
+    await this.ctx.storage.put('execution-mode', mode);
+    this.log('mode.set', { mode });
+  }
+
+  // ─── Code Mode execution ──────────────────────────────────────────────────
+
+  private async executeCode(code: string, jwtToken: string): Promise<unknown> {
+    if (!this.isCodeModeAvailable()) {
+      throw new Error(
+        'Code Mode is not available. A Cloudflare Workers paid plan is required. ' +
+        'Upgrade at https://dash.cloudflare.com'
+      );
+    }
+
+    const apiBaseUrl = this.env.LISTINGS_API_URL;
+    const executionId = `exec-${Date.now()}-${crypto.randomUUID().slice(0, 8)}`;
+
+    this.log('codemode.execute_start', { executionId });
+
+    // Build the Dynamic Worker module. JWT and apiBaseUrl are injected as
+    // template literals here — the LLM never sees them.
+    const workerCode = `
+export default {
+  async fetch(req, env, ctx) {
+    try {
+      const apiFetch = async (path, options = {}) => {
+        const resp = await fetch(\`${apiBaseUrl}\${path}\`, {
+          method: options.method ?? 'GET',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': 'Bearer ${jwtToken}',
+          },
+          body: options.body ? JSON.stringify(options.body) : undefined,
+        });
+        if (!resp.ok) {
+          const text = await resp.text();
+          throw new Error(\`API \${options.method ?? 'GET'} \${path} failed \${resp.status}: \${text}\`);
+        }
+        return resp.json();
+      };
+
+      const userFn = ${code};
+      const result = await userFn(apiFetch);
+      return new Response(JSON.stringify({ success: true, result }), {
+        headers: { 'Content-Type': 'application/json' },
+      });
+    } catch (err) {
+      return new Response(JSON.stringify({ success: false, error: err.message }), {
+        status: 500,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }
+  }
+};
+`;
+
+    const worker = this.env.CODE_EXECUTOR.get(executionId, async () => ({
+      compatibilityDate: '2025-06-01',
+      compatibilityFlags: ['nodejs_compat'],
+      mainModule: 'executor.js',
+      modules: { 'executor.js': workerCode },
+    }));
+
+    const response = await worker.getEntrypoint().fetch('http://localhost/run');
+    const data = (await response.json()) as { success: boolean; result?: unknown; error?: string };
+
+    if (!data.success) {
+      this.log('codemode.execute_error', { executionId, error: data.error });
+      throw new Error(data.error ?? 'Code execution failed');
+    }
+
+    this.log('codemode.execute_success', { executionId });
+    return data.result;
+  }
+
+  // ─── Usage ────────────────────────────────────────────────────────────────
 
   async getUsage(): Promise<UsageStats> {
     return (
@@ -120,21 +209,35 @@ export class RealEstateAgent extends AIChatAgent<Env> {
       this.ctx.storage.delete('usage'),
       this.ctx.storage.delete('jwt-token'),
       this.ctx.storage.delete('seller-full-name'),
+      this.ctx.storage.delete('execution-mode'),
     ]);
     this.cachedToken = null;
     this.cachedFullName = null;
     this.log('state.reset');
   }
 
+  // ─── Chat ─────────────────────────────────────────────────────────────────
+
   async onChatMessage(onFinish: StreamTextOnFinishCallback<ToolSet>) {
     const anthropic = createAnthropic({ apiKey: this.env.ANTHROPIC_API_KEY });
     const model = anthropic('claude-sonnet-4-5');
 
-    const { token, fullName } = await this.getTokenAndName();
-    const msgCount = this.messages.length;
-    this.log('chat.message_received', { messageCount: msgCount, sellerName: fullName });
+    const [{ token, fullName }, mode] = await Promise.all([
+      this.getTokenAndName(),
+      this.getMode(),
+    ]);
 
-    const tools = {
+    this.log('chat.message_received', {
+      messageCount: this.messages.length,
+      sellerName: fullName,
+      mode: mode ?? 'unset',
+    });
+
+    const codeModeAvailable = this.isCodeModeAvailable();
+
+    // ── Direct tools ──────────────────────────────────────────────────────
+
+    const directTools = {
       listMyListings: tool({
         description: "Get all listings belonging to the authenticated seller's account only.",
         inputSchema: z.object({}),
@@ -196,22 +299,95 @@ export class RealEstateAgent extends AIChatAgent<Env> {
         }),
         execute: async (input: Record<string, unknown>) => {
           this.log('tool.createListing', { title: input.title, price: input.price });
-          const data = await this.apiFetch(token, '/listings', {
-            method: 'POST',
-            body: input,
-          });
+          const data = await this.apiFetch(token, '/listings', { method: 'POST', body: input });
           this.log('tool.createListing.success', { result: data });
           return JSON.stringify(data);
         },
       }),
     };
 
+    // ── Code mode tool ────────────────────────────────────────────────────
+
+    const codeTool = {
+      execute: tool({
+        description:
+          'Execute a JavaScript async function to interact with the listings API. ' +
+          'Use for any operation: create, read, search, update, delete. ' +
+          'Batching multiple operations in one call saves tokens.',
+        inputSchema: z.object({
+          reasoning: z.string().describe('Brief explanation of what the code does'),
+          code: z
+            .string()
+            .describe(
+              'An async arrow function: async (apiFetch) => { ... }. ' +
+              'Call apiFetch(path, { method, body }) for all API operations. Return the result.'
+            ),
+        }),
+        execute: async ({ reasoning, code }) => {
+          this.log('tool.execute', { reasoning });
+          try {
+            const result = await this.executeCode(code, token);
+            return JSON.stringify({ success: true, result });
+          } catch (err: unknown) {
+            const msg = err instanceof Error ? err.message : String(err);
+            return JSON.stringify({ success: false, error: msg });
+          }
+        },
+      }),
+    };
+
+    // ── setExecutionMode tool (only when mode is unset) ───────────────────
+
+    const setModeTool = {
+      setExecutionMode: tool({
+        description: 'Set the execution mode for this session.',
+        inputSchema: z.object({
+          mode: z.enum(['direct', 'codemode']).describe(
+            '"direct" = standard tool calls, "codemode" = Dynamic Worker code execution'
+          ),
+        }),
+        execute: async ({ mode: selectedMode }) => {
+          if (selectedMode === 'codemode' && !codeModeAvailable) {
+            return JSON.stringify({
+              success: false,
+              error:
+                'Code Mode is not available. A Cloudflare Workers paid plan is required. ' +
+                'Upgrade at https://dash.cloudflare.com',
+            });
+          }
+          await this.setMode(selectedMode);
+          return JSON.stringify({ success: true, mode: selectedMode });
+        },
+      }),
+    };
+
+    // ── Assemble tool set based on current mode ───────────────────────────
+
+    let tools: ToolSet;
+    let systemPrompt: string;
+
+    if (mode === null) {
+      // Mode not yet chosen — include everything so the LLM can ask then act in one turn
+      tools = {
+        ...directTools,
+        ...(codeModeAvailable ? codeTool : {}),
+        ...setModeTool,
+      } as ToolSet;
+      systemPrompt = buildModeSelectionPrompt(fullName, codeModeAvailable);
+    } else if (mode === 'codemode') {
+      tools = codeTool as ToolSet;
+      systemPrompt = buildCodeModePrompt(fullName);
+    } else {
+      tools = directTools as ToolSet;
+      systemPrompt = buildDirectPrompt(fullName);
+    }
+
     const result = streamText({
       model,
-      system: buildSystemPrompt(fullName, this.isCodeModeAvailable()),
+      system: systemPrompt,
       messages: convertToModelMessages(this.messages),
       tools,
-      stopWhen: stepCountIs(4),
+      stopWhen: stepCountIs(5),
       onFinish: async (event) => {
         const usage = event.usage;
         if (usage) {
@@ -223,6 +399,7 @@ export class RealEstateAgent extends AIChatAgent<Env> {
           };
           await this.ctx.storage.put('usage', updated);
           this.log('chat.finished', {
+            mode: mode ?? 'unset',
             inputTokens: usage.inputTokens,
             outputTokens: usage.outputTokens,
             totalInputTokens: updated.inputTokens,
@@ -238,41 +415,94 @@ export class RealEstateAgent extends AIChatAgent<Env> {
   }
 }
 
-function buildSystemPrompt(sellerName: string, codeModeAvailable: boolean): string {
-  const codeModeStatus = codeModeAvailable
-    ? `Code Mode (Dynamic Workers) is AVAILABLE. When the user requests it, you will switch to code mode execution.`
-    : `Code Mode (Dynamic Workers) is NOT AVAILABLE on this account. It requires a Cloudflare Workers paid plan. If the user asks to use code mode, explain this clearly and let them know they can upgrade at https://dash.cloudflare.com to enable it. Continue using direct tool calls instead.`;
+// ─── System prompts ─────────────────────────────────────────────────────────
 
-  return `You are a helpful real estate assistant that manages property listings on behalf of a seller.
-
-## Execution mode
-${codeModeStatus}
-
-## Tools available
-- listMyListings: listings for the authenticated seller (${sellerName}) only
-- listAllListings: all active public listings across every seller, with optional filters
-- createListing: create a new listing
-
-## Clarifying question rules
-
-**Viewing listings:** When the user asks to show, list, or view listings — and they have NOT
-specified whose — ask before calling any tool:
-  "Would you like to see all listings across the platform, or just the listings for ${sellerName}?"
-
-**Creating a listing:** When the user asks to create a listing and has NOT specified whether it
-should be public or private, ask before calling the tool:
-  "Should this listing be public (active and visible to buyers) or private (saved as a draft)?"
-
-In both cases, wait for their answer before proceeding. Skip the question if they already specified
-(e.g. "create a public listing", "save it as a draft", "show MY listings", "show ALL listings").
-
-## Important data rules
-- price and hoaFee are always in CENTS. Convert dollars: $450,000 → 45000000
+const DATA_RULES = `## Data rules
+- price and hoaFee are always in CENTS. $450,000 → 45000000
 - baths must be a multiple of 0.5 (e.g. 1, 1.5, 2, 2.5)
 - state must be a 2-letter abbreviation (e.g. "TX", "CA")
 - zip must be at least 5 characters
-- status: use "active" for public, "draft" for private
+- status: "active" = public, "draft" = private`;
 
-When creating a listing, confirm back with the listing ID returned.
-Keep responses concise.`;
+const LISTING_CLARIFICATIONS = `## Clarifying question rules
+**Viewing listings:** If the user hasn't specified whose listings, ask:
+  "Would you like to see all listings across the platform, or just yours?"
+**Creating a listing:** If the user hasn't specified public or private, ask:
+  "Should this listing be public (active) or private (draft)?"
+Skip the question if they already specified. Wait for their answer before calling any tool.`;
+
+function buildModeSelectionPrompt(sellerName: string, codeModeAvailable: boolean): string {
+  const modeOptions = codeModeAvailable
+    ? `- **Direct tool calls** — standard approach, one tool call per operation
+- **Code Mode** — LLM writes code executed in a Dynamic Worker sandbox; fewer tokens for multi-step tasks`
+    : `- **Direct tool calls** — the only available option (Code Mode requires a paid Cloudflare Workers plan)`;
+
+  return `You are a helpful real estate assistant for ${sellerName}.
+
+## Execution mode — NOT YET SET
+Before performing any listing operation, you MUST ask the user which execution mode to use:
+  "How would you like me to execute this? Options:
+${modeOptions}"
+
+If the user's message already specifies a mode (e.g. "use code mode", "use direct tools"), call
+setExecutionMode immediately with that choice, then proceed with the operation in the same response.
+Otherwise ask the question and wait.
+
+Once setExecutionMode is called, use the matching tools for the rest of the response.
+
+${LISTING_CLARIFICATIONS}
+
+${DATA_RULES}
+
+When creating a listing, confirm back with the listing ID. Keep responses concise.`;
+}
+
+function buildDirectPrompt(sellerName: string): string {
+  return `You are a helpful real estate assistant for ${sellerName}.
+
+## Execution mode: Direct tool calls
+Use listMyListings, listAllListings, and createListing to fulfil requests.
+
+${LISTING_CLARIFICATIONS}
+
+${DATA_RULES}
+
+When creating a listing, confirm back with the listing ID. Keep responses concise.`;
+}
+
+function buildCodeModePrompt(sellerName: string): string {
+  return `You are a helpful real estate assistant for ${sellerName}.
+
+## Execution mode: Code Mode (Dynamic Workers)
+Use the execute tool for ALL operations. Write an async arrow function that calls apiFetch.
+
+### API reference
+- GET  /listings/mine/all          — seller's listings
+- GET  /listings?city=&minPrice=&maxPrice=&minBeds=&propertyType=  — public search
+- GET  /listings/:id               — single listing
+- POST /listings                   — create listing (body below)
+- PUT  /listings/:id               — update listing
+- DELETE /listings/:id             — delete listing
+
+### Create/update body
+title (req), description, price (CENTS), addressLine1 (req), addressLine2,
+city (req), state (2-char req), zip (5+ req), beds (int req), baths (0.5 multiples req),
+sqft, lotSqft, yearBuilt, propertyType (single_family|condo|townhouse|multi_family|land),
+garageSpaces (int, default 0), hasPool (bool), hoaFee (CENTS/mo), status (active|draft)
+
+### Code signature
+async (apiFetch) => {
+  // apiFetch(path, { method?, body? }) returns parsed JSON
+  return await apiFetch('/listings/mine/all');
+}
+
+### Key rules
+- price and hoaFee in CENTS ($450k = 45000000)
+- Batch related operations in ONE execute call to save tokens
+- status: "active" = public, "draft" = private
+- Always return a useful value from the function
+
+${LISTING_CLARIFICATIONS}
+
+When creating a listing, confirm back with the listing ID. Keep responses concise.`;
 }

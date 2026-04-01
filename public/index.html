@@ -17,18 +17,10 @@
     <header class="border-b border-zinc-800 px-6 py-3 flex items-center justify-between">
       <h1 class="font-semibold text-zinc-100">Real Estate Agent</h1>
 
-      <!-- Token counter -->
-      <div class="flex items-center gap-4">
-        <div id="tokenStats" class="text-xs text-zinc-500 flex gap-3 font-mono">
-          <span>↑ <span id="inputTokens">0</span> in</span>
-          <span>↓ <span id="outputTokens">0</span> out</span>
-          <span>⟳ <span id="requests">0</span> req</span>
-        </div>
-        <button
-          id="clearBtn"
-          class="text-xs text-zinc-500 hover:text-zinc-300 border border-zinc-700 rounded px-3 py-1 transition-colors"
-        >Clear</button>
-      </div>
+      <button
+        id="clearBtn"
+        class="text-xs text-zinc-500 hover:text-zinc-300 border border-zinc-700 rounded px-3 py-1 transition-colors"
+      >Clear</button>
     </header>
 
     <!-- Messages -->
@@ -61,24 +53,21 @@
       const inputEl = document.getElementById('input');
       const sendBtn = document.getElementById('sendBtn');
       const clearBtn = document.getElementById('clearBtn');
-      const inputTokensEl = document.getElementById('inputTokens');
-      const outputTokensEl = document.getElementById('outputTokens');
-      const requestsEl = document.getElementById('requests');
 
       let ws = null;
       let chatMessages = [];
       let streaming = { element: null, content: '' };
       let toolElement = null;
       let awaitingResponse = false;
+      let usageBeforeSend = { inputTokens: 0, outputTokens: 0, requests: 0 };
+      let lastAssistantEl = null;
 
       async function refreshUsage() {
         try {
           const resp = await fetch('/api/usage');
-          const { inputTokens, outputTokens, requests } = await resp.json();
-          inputTokensEl.textContent = inputTokens.toLocaleString();
-          outputTokensEl.textContent = outputTokens.toLocaleString();
-          requestsEl.textContent = requests.toLocaleString();
+          return await resp.json();
         } catch {}
+        return null;
       }
 
       function connect() {
@@ -87,7 +76,6 @@
         ws.onopen = () => {
           sendBtn.disabled = false;
           appendStatus('Connected');
-          refreshUsage();
         };
 
         ws.onclose = () => {
@@ -110,6 +98,7 @@
           case 'text-start':
             streaming.content = '';
             streaming.element = appendAssistant('');
+            lastAssistantEl = streaming.element;
             toolElement = null;
             break;
 
@@ -126,7 +115,13 @@
               awaitingResponse = false;
               sendBtn.disabled = false;
               inputEl.disabled = false;
-              refreshUsage();
+              refreshUsage().then((current) => {
+                if (current && lastAssistantEl) {
+                  const deltaIn = current.inputTokens - usageBeforeSend.inputTokens;
+                  const deltaOut = current.outputTokens - usageBeforeSend.outputTokens;
+                  appendTokenBadge(lastAssistantEl, deltaIn, deltaOut);
+                }
+              });
             }
             streaming.element = null;
             break;
@@ -176,6 +171,14 @@
         scrollBottom();
       }
 
+      function appendTokenBadge(parentEl, deltaIn, deltaOut) {
+        const div = document.createElement('div');
+        div.className = 'mt-1 text-xs text-zinc-600 font-mono';
+        div.textContent = `↑ ${deltaIn.toLocaleString()} in · ↓ ${deltaOut.toLocaleString()} out`;
+        parentEl.appendChild(div);
+        scrollBottom();
+      }
+
       function appendStatus(text) {
         const div = document.createElement('div');
         div.className = 'text-xs text-zinc-600 text-center py-1';
@@ -187,7 +190,7 @@
         messagesEl.scrollTop = messagesEl.scrollHeight;
       }
 
-      function send() {
+      async function send() {
         const text = inputEl.value.trim();
         if (!text || !ws || ws.readyState !== WebSocket.OPEN || awaitingResponse) return;
 
@@ -199,6 +202,10 @@
         awaitingResponse = true;
         sendBtn.disabled = true;
         inputEl.disabled = true;
+
+        // Snapshot usage before sending so we can compute the delta after
+        const snapshot = await refreshUsage();
+        usageBeforeSend = snapshot ?? usageBeforeSend;
 
         ws.send(JSON.stringify({
           type: 'cf_agent_use_chat_request',
@@ -217,9 +224,7 @@
         await fetch('/api/clear', { method: 'POST' });
         chatMessages = [];
         messagesEl.innerHTML = '';
-        inputTokensEl.textContent = '0';
-        outputTokensEl.textContent = '0';
-        requestsEl.textContent = '0';
+        usageBeforeSend = { inputTokens: 0, outputTokens: 0, requests: 0 };
         appendStatus('Cleared');
       });
 

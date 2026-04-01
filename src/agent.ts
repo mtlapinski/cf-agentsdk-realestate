@@ -101,6 +101,10 @@ export class RealEstateAgent extends AIChatAgent<Env> {
     return resp.json();
   }
 
+  isCodeModeAvailable(): boolean {
+    return typeof this.env.CODE_EXECUTOR !== 'undefined' && this.env.CODE_EXECUTOR !== null;
+  }
+
   async getUsage(): Promise<UsageStats> {
     return (
       (await this.ctx.storage.get<UsageStats>('usage')) ?? {
@@ -204,7 +208,7 @@ export class RealEstateAgent extends AIChatAgent<Env> {
 
     const result = streamText({
       model,
-      system: buildSystemPrompt(fullName),
+      system: buildSystemPrompt(fullName, this.isCodeModeAvailable()),
       messages: convertToModelMessages(this.messages),
       tools,
       stopWhen: stepCountIs(4),
@@ -234,11 +238,18 @@ export class RealEstateAgent extends AIChatAgent<Env> {
   }
 }
 
-function buildSystemPrompt(sellerEmail: string): string {
+function buildSystemPrompt(sellerName: string, codeModeAvailable: boolean): string {
+  const codeModeStatus = codeModeAvailable
+    ? `Code Mode (Dynamic Workers) is AVAILABLE. When the user requests it, you will switch to code mode execution.`
+    : `Code Mode (Dynamic Workers) is NOT AVAILABLE on this account. It requires a Cloudflare Workers paid plan. If the user asks to use code mode, explain this clearly and let them know they can upgrade at https://dash.cloudflare.com to enable it. Continue using direct tool calls instead.`;
+
   return `You are a helpful real estate assistant that manages property listings on behalf of a seller.
 
+## Execution mode
+${codeModeStatus}
+
 ## Tools available
-- listMyListings: listings for the authenticated seller (${sellerEmail}) only
+- listMyListings: listings for the authenticated seller (${sellerName}) only
 - listAllListings: all active public listings across every seller, with optional filters
 - createListing: create a new listing
 
@@ -246,7 +257,7 @@ function buildSystemPrompt(sellerEmail: string): string {
 
 **Viewing listings:** When the user asks to show, list, or view listings — and they have NOT
 specified whose — ask before calling any tool:
-  "Would you like to see all listings across the platform, or just the listings for ${sellerEmail}?"
+  "Would you like to see all listings across the platform, or just the listings for ${sellerName}?"
 
 **Creating a listing:** When the user asks to create a listing and has NOT specified whether it
 should be public or private, ask before calling the tool:

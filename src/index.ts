@@ -14,6 +14,12 @@ function getAgentStub(env: Env): RealEstateAgent {
 
 app.get('/health', (c) => c.json({ status: 'ok', ts: Date.now() }));
 
+app.get('/api/mode', async (c) => {
+  const stub = getAgentStub(c.env);
+  const available = stub.isCodeModeAvailable();
+  return c.json({ codeMode: 'direct', codeModeAvailable: available });
+});
+
 app.get('/api/usage', async (c) => {
   const stub = getAgentStub(c.env);
   const usage = await stub.getUsage();

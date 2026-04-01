@@ -115,13 +115,18 @@
               awaitingResponse = false;
               sendBtn.disabled = false;
               inputEl.disabled = false;
-              refreshUsage().then((current) => {
-                if (current && lastAssistantEl) {
-                  const deltaIn = current.inputTokens - usageBeforeSend.inputTokens;
-                  const deltaOut = current.outputTokens - usageBeforeSend.outputTokens;
-                  appendTokenBadge(lastAssistantEl, deltaIn, deltaOut);
+              const capturedEl = lastAssistantEl;
+              const capturedBefore = { ...usageBeforeSend };
+              setTimeout(async () => {
+                const current = await refreshUsage();
+                if (current && capturedEl) {
+                  const deltaIn = current.inputTokens - capturedBefore.inputTokens;
+                  const deltaOut = current.outputTokens - capturedBefore.outputTokens;
+                  if (deltaIn > 0 || deltaOut > 0) {
+                    appendTokenBadge(capturedEl, deltaIn, deltaOut);
+                  }
                 }
-              });
+              }, 500);
             }
             streaming.element = null;
             break;

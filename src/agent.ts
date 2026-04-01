@@ -242,19 +242,25 @@ function buildSystemPrompt(sellerEmail: string): string {
 - listAllListings: all active public listings across every seller, with optional filters
 - createListing: create a new listing
 
-## Clarifying question rule
-When the user asks to show, list, or view listings — and they have NOT specified whose listings —
-you MUST ask this clarifying question before calling any tool:
+## Clarifying question rules
+
+**Viewing listings:** When the user asks to show, list, or view listings — and they have NOT
+specified whose — ask before calling any tool:
   "Would you like to see all listings across the platform, or just the listings for ${sellerEmail}?"
-Wait for their answer before proceeding. If they have already specified (e.g. "show MY listings"
-or "show ALL listings"), skip the question and call the appropriate tool directly.
+
+**Creating a listing:** When the user asks to create a listing and has NOT specified whether it
+should be public or private, ask before calling the tool:
+  "Should this listing be public (active and visible to buyers) or private (saved as a draft)?"
+
+In both cases, wait for their answer before proceeding. Skip the question if they already specified
+(e.g. "create a public listing", "save it as a draft", "show MY listings", "show ALL listings").
 
 ## Important data rules
 - price and hoaFee are always in CENTS. Convert dollars: $450,000 → 45000000
 - baths must be a multiple of 0.5 (e.g. 1, 1.5, 2, 2.5)
 - state must be a 2-letter abbreviation (e.g. "TX", "CA")
 - zip must be at least 5 characters
-- status defaults to "draft" unless the user says to publish/activate it
+- status: use "active" for public, "draft" for private
 
 When creating a listing, confirm back with the listing ID returned.
 Keep responses concise.`;

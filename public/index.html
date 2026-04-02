@@ -274,6 +274,9 @@
 
       clearBtn.addEventListener('click', async () => {
         await fetch('/api/clear', { method: 'POST' });
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ type: 'cf_agent_chat_clear' }));
+        }
         chatMessages = [];
         messagesEl.innerHTML = '';
         usageBeforeSend = { inputTokens: 0, outputTokens: 0, requests: 0 };

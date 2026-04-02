@@ -47,7 +47,10 @@ export class RealEstateAgent extends AIChatAgent<Env> {
       return { token: storedToken, fullName: storedName };
     }
 
-    this.log('auth.login_start', { email: this.env.SELLER_EMAIL });
+    this.log('auth.login_start', {
+      email: this.env.SELLER_EMAIL ?? '(SELLER_EMAIL secret not set)',
+      hasPassword: !!this.env.SELLER_PASSWORD,
+    });
     const resp = await fetch(`${this.env.LISTINGS_API_URL}/auth/login`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -134,7 +137,7 @@ export class RealEstateAgent extends AIChatAgent<Env> {
     const apiBaseUrl = this.env.LISTINGS_API_URL;
     const executionId = `exec-${Date.now()}-${crypto.randomUUID().slice(0, 8)}`;
 
-    this.log('codemode.execute_start', { executionId });
+    this.log('codemode.execute_start', { executionId, path: 'DYNAMIC_WORKER', binding: 'CODE_EXECUTOR' });
 
     // Build the Dynamic Worker module. JWT and apiBaseUrl are injected as
     // template literals here — the LLM never sees them.
@@ -173,6 +176,7 @@ export default {
 };
 `;
 
+    this.log('codemode.dynamic_worker_instantiate', { executionId, generatedCode: workerCode });
     const worker = this.env.CODE_EXECUTOR.get(executionId, async () => ({
       compatibilityDate: '2025-06-01',
       compatibilityFlags: ['nodejs_compat'],
@@ -242,7 +246,7 @@ export default {
         description: "Get all listings belonging to the authenticated seller's account only.",
         inputSchema: z.object({}),
         execute: async (_args) => {
-          this.log('tool.listMyListings');
+          this.log('direct.listMyListings', { path: 'DIRECT_TOOL_CALLS' });
           const data = await this.apiFetch(token, '/listings/mine/all');
           return JSON.stringify(data);
         },
@@ -267,7 +271,7 @@ export default {
           if (args.minBeds) params.set('minBeds', String(args.minBeds));
           if (args.propertyType) params.set('propertyType', args.propertyType);
           const qs = params.toString();
-          this.log('tool.listAllListings', { filters: args });
+          this.log('direct.listAllListings', { path: 'DIRECT_TOOL_CALLS', filters: args });
           const data = await this.apiFetch(token, `/listings${qs ? `?${qs}` : ''}`);
           return JSON.stringify(data);
         },
@@ -298,7 +302,7 @@ export default {
           status: z.enum(['draft', 'active']).default('draft'),
         }),
         execute: async (input: Record<string, unknown>) => {
-          this.log('tool.createListing', { title: input.title, price: input.price });
+          this.log('direct.createListing', { path: 'DIRECT_TOOL_CALLS', title: input.title, price: input.price });
           const data = await this.apiFetch(token, '/listings', { method: 'POST', body: input });
           this.log('tool.createListing.success', { result: data });
           return JSON.stringify(data);
@@ -324,7 +328,7 @@ export default {
             ),
         }),
         execute: async ({ reasoning, code }) => {
-          this.log('tool.execute', { reasoning });
+          this.log('codemode.tool_called', { path: 'CODE_MODE → DYNAMIC_WORKER', reasoning });
           try {
             const result = await this.executeCode(code, token);
             return JSON.stringify({ success: true, result });
@@ -374,12 +378,21 @@ export default {
         ...setModeTool,
       } as ToolSet;
       systemPrompt = buildModeSelectionPrompt(fullName, codeModeAvailable);
+      this.log('dispatch.path', { path: 'MODE_SELECTION', availableTools: Object.keys(tools) });
     } else if (mode === 'codemode') {
-      tools = codeTool as ToolSet;
+      // setModeTool always included so the user can switch back to direct at any time
+      tools = { ...codeTool, ...setModeTool } as ToolSet;
       systemPrompt = buildCodeModePrompt(fullName);
+      this.log('dispatch.path', {
+        path: 'CODE_MODE → DYNAMIC_WORKER',
+        codeModeAvailable,
+        availableTools: Object.keys(tools),
+      });
     } else {
-      tools = directTools as ToolSet;
+      // setModeTool always included so the user can switch to code mode at any time
+      tools = { ...directTools, ...setModeTool } as ToolSet;
       systemPrompt = buildDirectPrompt(fullName);
+      this.log('dispatch.path', { path: 'DIRECT_TOOL_CALLS', availableTools: Object.keys(tools) });
     }
 
     const result = streamText({
@@ -462,6 +475,7 @@ function buildDirectPrompt(sellerName: string): string {
 
 ## Execution mode: Direct tool calls
 Use listMyListings, listAllListings, and createListing to fulfil requests.
+To switch to Code Mode, call setExecutionMode({ mode: "codemode" }) then proceed.
 
 ${LISTING_CLARIFICATIONS}
 
@@ -475,6 +489,7 @@ function buildCodeModePrompt(sellerName: string): string {
 
 ## Execution mode: Code Mode (Dynamic Workers)
 Use the execute tool for ALL operations. Write an async arrow function that calls apiFetch.
+To switch back to Direct tool calls, call setExecutionMode({ mode: "direct" }) then proceed.
 
 ### API reference
 - GET  /listings/mine/all          — seller's listings
